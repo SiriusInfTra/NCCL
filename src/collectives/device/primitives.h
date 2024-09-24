@@ -12,7 +12,7 @@
 #include "common_kernel.h"
 #include "common.h"
 
-#define NCCL_SPINS_BEFORE_CHECK_ABORT 1000000
+#define NCCL_SPINS_BEFORE_CHECK_ABORT 10000
 
 /* Protocol classes: ProtoSimple, ProtoLL, ProtoLL128
  * We use these as template args to the Primtiives class instead of integral
