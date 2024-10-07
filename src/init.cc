@@ -6,6 +6,7 @@
 
 #include "nccl.h"
 #include "channel.h"
+#include "devcomm.h"
 #include "nvmlwrap.h"
 #include "gdrwrap.h"
 #include "bootstrap.h"
@@ -24,6 +25,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 
 #define STR2(v) #v
 #define STR(v) STR2(v)
@@ -2114,5 +2118,128 @@ ncclResult_t ncclCommUserRank(const ncclComm_t comm, int* rank) {
   NCCLCHECK(ncclCommEnsureReady(comm));
 
   *rank = comm->rank;
+  return ncclSuccess;
+}
+
+NCCL_API(ncclResult_t, ncclCommResetChannels, ncclComm_t comm);
+ncclResult_t ncclCommResetChannels(ncclComm_t comm) {
+  if (comm == NULL) {
+    return ncclSuccess;
+  }
+
+  // if (comm->abortFlag == NULL || *comm->abortFlag == 0) {
+  //   return ncclInvalidArgument;
+  // }
+
+  auto nChannels = comm->nChannels;
+  for (int c = 0; c < nChannels; c++) {
+    auto chan = comm->channels + c;
+
+    for (int r = 0; r < comm->nRanks; r++) {
+      auto send = &chan->peers[r]->send[0].conn;
+      auto recv = &chan->peers[r]->recv[0].conn;
+      if (send->buffs[NCCL_PROTO_LL] == NULL || recv->buffs[NCCL_PROTO_LL] == NULL) {
+        continue;
+      }
+      
+      CUDACHECK(cudaMemcpyAsync(&chan->devPeersHostPtr[r]->send, send, 
+          sizeof(ncclConnInfo), cudaMemcpyDefault,
+          comm->sharedRes->deviceStream.cudaStream));
+      CUDACHECK(cudaMemcpyAsync(&chan->devPeersHostPtr[r]->recv, recv, 
+          sizeof(ncclConnInfo), cudaMemcpyDefault,
+          comm->sharedRes->deviceStream.cudaStream));
+
+      CUDACHECK(cudaMemsetAsync(send->head, 0, sizeof(uint64_t), 
+          comm->sharedRes->deviceStream.cudaStream));
+      CUDACHECK(cudaMemsetAsync(send->tail, 0, sizeof(uint64_t), 
+          comm->sharedRes->deviceStream.cudaStream));
+      CUDACHECK(cudaMemsetAsync(recv->head, 0, sizeof(uint64_t), 
+          comm->sharedRes->deviceStream.cudaStream));
+      CUDACHECK(cudaMemsetAsync(recv->tail, 0, sizeof(uint64_t), 
+          comm->sharedRes->deviceStream.cudaStream));
+      CUDACHECK(cudaMemsetAsync(send->buffs[NCCL_PROTO_LL], 0, 
+          comm->buffSizes[NCCL_PROTO_LL], comm->sharedRes->deviceStream.cudaStream));
+      CUDACHECK(cudaMemsetAsync(recv->buffs[NCCL_PROTO_LL], 0, 
+          comm->buffSizes[NCCL_PROTO_LL], comm->sharedRes->deviceStream.cudaStream));
+
+      CUDACHECK(cudaStreamSynchronize(comm->sharedRes->deviceStream.cudaStream));
+    }
+  }
+  return ncclSuccess;
+}
+
+NCCL_API(ncclResult_t, ncclCommShowChannelInfo, ncclComm_t comm);
+ncclResult_t ncclCommShowChannelInfo(ncclComm_t comm) {
+  if (comm == NULL) {
+    return ncclSuccess;
+  }
+
+  std::stringstream ss;
+  auto now = std::chrono::system_clock::now();
+  std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+  std::tm now_tm = *std::localtime(&now_c);
+  ss << "[NCCL INFO " <<  std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << "] "
+     << "[" << comm->rank << "] Channel Info:\n";
+
+  auto nChannels = comm->nChannels;
+  for (int c = 0; c < nChannels; c++) {
+    auto chan = comm->channels + c;
+    std::stringstream chan_ss;
+    for (int r = 0; r < comm->nRanks; r++) {
+      auto send = &chan->peers[r]->send[0].conn;
+      auto recv = &chan->peers[r]->recv[0].conn;
+      if (send->buffs[NCCL_PROTO_LL] == NULL || recv->buffs[NCCL_PROTO_LL] == NULL) {
+        continue;
+      }
+
+      ncclDevChannelPeer dev_peer;
+      uint64_t send_head = 0, send_tail = 0, send_step = 0,
+               recv_head = 0, recv_tail = 0, recv_step = 0;
+      int send_buf[4], recv_buf[4]; // first 128 bytes
+
+      CUDACHECK(cudaMemcpyAsync(&dev_peer, chan->devPeersHostPtr[r], 
+          sizeof(ncclDevChannelPeer), cudaMemcpyDefault, 
+          comm->sharedRes->hostStream.cudaStream
+      ));
+
+      CUDACHECK(cudaMemcpyAsync(&send_head, send->head, sizeof(uint64_t), 
+          cudaMemcpyDefault, comm->sharedRes->hostStream.cudaStream));
+      CUDACHECK(cudaMemcpyAsync(&send_tail, send->tail, sizeof(uint64_t), 
+          cudaMemcpyDefault, comm->sharedRes->hostStream.cudaStream));
+      CUDACHECK(cudaMemcpyAsync(&recv_head, recv->head, sizeof(uint64_t), 
+          cudaMemcpyDefault, comm->sharedRes->hostStream.cudaStream));
+      CUDACHECK(cudaMemcpyAsync(&recv_tail, recv->tail, sizeof(uint64_t), 
+          cudaMemcpyDefault, comm->sharedRes->hostStream.cudaStream));
+
+      CUDACHECK(cudaMemcpyAsync(send_buf, send->buffs[NCCL_PROTO_LL], sizeof(int) * 4, 
+          cudaMemcpyDefault, comm->sharedRes->hostStream.cudaStream));
+      CUDACHECK(cudaMemcpyAsync(recv_buf, recv->buffs[NCCL_PROTO_LL], sizeof(int) * 4,
+          cudaMemcpyDefault, comm->sharedRes->hostStream.cudaStream));
+
+      CUDACHECK(cudaStreamSynchronize(comm->sharedRes->hostStream.cudaStream));
+
+      send_step = dev_peer.send[0].step;
+      recv_step = dev_peer.recv[0].step;
+
+      chan_ss << "chan " << c << " peer " << r << ": "
+              << "send head " << send_head 
+              << " tail " << send_tail 
+              << " step " << send_step
+              << " buf " << static_cast<void*>(send->buffs[NCCL_PROTO_LL])
+              << "(" << send_buf[0] << " " << send_buf[1] << " " 
+              << send_buf[2] << " " << send_buf[3] << " ...)" 
+              << ", "
+              << "recv head " << recv_head
+              << " tail " << recv_tail
+              << " step " << recv_step
+              << " buf " << static_cast<void*>(recv->buffs[NCCL_PROTO_LL])  
+              << "(" << recv_buf[0] << " " << recv_buf[1] << " "
+              << recv_buf[2] << " " << recv_buf[3] << " ...)"
+              << "\n";
+      ss << chan_ss.str();
+    }
+  }
+
+  fprintf(stderr, "%s\n", ss.str().c_str());
   return ncclSuccess;
 }
