@@ -582,8 +582,12 @@ ncclResult_t ncclTopoGetXmlFromSys(struct ncclXmlNode* pciNode, struct ncclXml* 
     NCCLCHECK(xmlGetAttrStr(pciNode, "busid", &newBusId));
     for (int s=0; s<parent->nSubs; s++) {
       const char* busId;
-      NCCLCHECK(xmlGetAttrStr(parent->subs[s], "busid", &busId));
-      if (strcmp(newBusId, busId) < 0) { subIndex = s; break; }
+      // NCCLCHECK(xmlGetAttrStr(parent->subs[s], "busid", &busId));
+      // if (strcmp(newBusId, busId) < 0) { subIndex = s; break; }
+      
+      // https://github.com/NVIDIA/nccl/issues/1125
+      NCCLCHECK(xmlGetAttr(parent->subs[s], "busid", &busId));
+      if (busId != NULL && strcmp(newBusId, busId) < 0) { subIndex = s; break; }
     }
     for (int s = parent->nSubs; s > subIndex; s--) parent->subs[s] = parent->subs[s-1];
     parent->subs[subIndex] = pciNode;
